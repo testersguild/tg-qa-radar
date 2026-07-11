@@ -1,1064 +1,615 @@
-import os
-import requests
-import json
-from datetime import datetime
-from typing import List, Dict, Set
-import time
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
 import hashlib
-import xml.etree.ElementTree as ET
+import json
 import logging
+import os
 import re
-from urllib.parse import urljoin, quote
+import sys
+import tempfile
+import time
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set
+
+import requests
 from bs4 import BeautifulSoup
 
-# Configure logging
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("qa_job_bot")
 
-# Discord Webhook URL from environment variable
-DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+POSTED_JOBS_FILE = os.getenv("POSTED_JOBS_FILE", "posted_jobs.json")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "20"))
+DISCORD_POST_DELAY = float(os.getenv("DISCORD_POST_DELAY", "1.0"))
+KEEP_HISTORY_DAYS = int(os.getenv("KEEP_HISTORY_DAYS", "60"))
 
-# File to track posted jobs (prevents duplicates)
-POSTED_JOBS_FILE = 'posted_jobs.json'
-
-# Request timeout
-REQUEST_TIMEOUT = 15
-
-# ============================================================
-# JOB SOURCES - Expanded & Fixed
-# ============================================================
-ENABLED_SOURCES = [
-    # Brazilian sources (fixed/working)
-    'programathor',
-    'gupy',
-    'trampos',
-    'revelo',
-    'geekhunter',
-    'greenhouse_br',
-    
-    # International remote sources (API-based, working)
-    'remoteok',
-    'remotive',
-    'weworkremotely',
-    'landing_jobs',
-    'wellfound',
-    'github_jobs',
-    'stack_overflow_jobs',
-    'himalayas',
-    ' Otta',
-    'arc_dev',
-    'remote_rocketship',
-    
-    # Greenhouse companies (global)
-    'greenhouse_global',
-    
-    # RSS/Feed sources
-    'indeed_rss',
-    'glassdoor_rss',
+# Empresas Greenhouse/Lever podem ser sobrescritas via env var, separadas por vírgula.
+# Ex.: GREENHOUSE_COMPANIES="nubank,vtex,stripe,notion"
+DEFAULT_GREENHOUSE_COMPANIES = [
+    # Verificadas como usuárias reais do board público do Greenhouse.
+    "nubank", "vtex", "stripe", "notion", "figma", "airtable", "webflow",
+    "cloudflare", "gitlab", "mongodb", "twilio", "coinbase", "asana",
+    "affirm", "robinhood", "grammarly", "instacart", "doordash", "reddit",
+]
+DEFAULT_LEVER_COMPANIES = [
+    "netflix", "shopify", "spotify", "canva", "brex", "ramp", "loom",
+    "rippling", "attentive", "eightsleep",
 ]
 
-def load_posted_jobs() -> Set[str]:
-    """Load previously posted job IDs to avoid duplicates"""
-    try:
-        if os.path.exists(POSTED_JOBS_FILE):
-            with open(POSTED_JOBS_FILE, 'r') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return set(data)
-    except Exception as e:
-        logger.warning(f"Error loading posted jobs: {e}")
-    return set()
+GREENHOUSE_COMPANIES = [
+    c.strip() for c in os.getenv("GREENHOUSE_COMPANIES", "").split(",") if c.strip()
+] or DEFAULT_GREENHOUSE_COMPANIES
 
-def save_posted_jobs(job_ids: Set[str]):
-    """Save posted job IDs"""
-    try:
-        with open(POSTED_JOBS_FILE, 'w') as f:
-            json.dump(list(job_ids), f)
-    except Exception as e:
-        logger.error(f"Error saving posted jobs: {e}")
+LEVER_COMPANIES = [
+    c.strip() for c in os.getenv("LEVER_COMPANIES", "").split(",") if c.strip()
+] or DEFAULT_LEVER_COMPANIES
 
-def generate_job_id(title: str, company: str) -> str:
-    """Generate unique ID for a job based on title and company"""
-    unique_string = f"{title.lower().strip()}_{company.lower().strip()}"
-    return hashlib.md5(unique_string.encode()).hexdigest()[:16]
+QA_KEYWORDS = [
+    r"qa", r"quality assurance", r"qualidade", r"tester", r"testador",
+    r"testadora", r"teste", r"tests?", r"testing", r"assurance", r"sdet",
+    r"automation", r"automa[cç][aã]o", r"playwright", r"cypress", r"selenium",
+    r"appium", r"postman", r"cucumber", r"robot framework", r"test engineer",
+    r"engenheiro de testes", r"engenheira de testes",
+]
+# Regex único com \b para evitar falsos positivos tipo "contest", "latest".
+QA_PATTERN = re.compile(
+    r"\b(" + "|".join(QA_KEYWORDS) + r")\b", flags=re.IGNORECASE
+)
 
-def make_request(url: str, params: dict = None, headers: dict = None, method: str = 'GET', data: dict = None) -> requests.Response:
-    """Make HTTP request with retries and rate limiting"""
-    default_headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/html, */*',
-        'Accept-Language': 'en-US,en;q=0.9,pt-BR;q=0.8',
-    }
-    if headers:
-        default_headers.update(headers)
-    
-    for attempt in range(3):
+SENIORITY_PATTERNS = {
+    "🌱 Júnior": re.compile(r"\b(jr|junior|júnior|trainee|estagio|estágio|intern)\b", re.I),
+    "🚀 Pleno": re.compile(r"\b(pleno|mid|middle|ii)\b", re.I),
+    "⭐ Sênior": re.compile(r"\b(senior|sênior|sr|lead|principal|staff|iii)\b", re.I),
+}
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; QAJobBot/2.0; +https://github.com/)",
+    "Accept": "application/json, application/rss+xml, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
+}
+
+
+@dataclass
+class Job:
+    title: str
+    company: str
+    location: str
+    url: str
+    source: str
+    country: str
+    id: str = field(default="")
+    salary: Optional[str] = None
+    posted_at: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.id:
+            self.id = generate_job_id(self.title, self.company, self.source)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def generate_job_id(title: str, company: str, source: str = "") -> str:
+    unique_string = f"{title.lower().strip()}_{company.lower().strip()}_{source.lower().strip()}"
+    return hashlib.md5(unique_string.encode("utf-8")).hexdigest()[:16]
+
+
+def is_qa_job(title: str) -> bool:
+    return bool(QA_PATTERN.search(title or ""))
+
+
+def detect_seniority(title: str) -> str:
+    for label, pattern in SENIORITY_PATTERNS.items():
+        if pattern.search(title or ""):
+            return label
+    return ""
+
+
+def make_request(
+    url: str,
+    params: dict = None,
+    headers: dict = None,
+    max_retries: int = 3,
+) -> Optional[requests.Response]:
+    """GET com retry/backoff exponencial e tratamento de rate limit."""
+    req_headers = {**DEFAULT_HEADERS, **(headers if headers else {})}
+    for attempt in range(max_retries):
         try:
-            if method == 'GET':
-                response = requests.get(url, params=params, headers=default_headers, timeout=REQUEST_TIMEOUT)
-            else:
-                response = requests.post(url, json=data, headers=default_headers, timeout=REQUEST_TIMEOUT)
-            
-            if response.status_code == 429:  # Rate limited
-                wait_time = 2 ** attempt + 1
-                logger.warning(f"Rate limited, waiting {wait_time}s...")
-                time.sleep(wait_time)
+            resp = requests.get(url, params=params, headers=req_headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                wait = min(2 ** attempt * 2, 30)
+                logger.warning(f"429 rate limited em {url}, aguardando {wait}s...")
+                time.sleep(wait)
                 continue
-            
-            return response
+            return resp
         except requests.exceptions.Timeout:
-            logger.warning(f"Timeout on attempt {attempt + 1}/3 for {url}")
+            logger.warning(f"Timeout ({attempt + 1}/{max_retries}) em {url}")
             time.sleep(2 ** attempt)
-        except Exception as e:
-            logger.error(f"Request error for {url}: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Erro de request ({attempt + 1}/{max_retries}) em {url}: {e}")
             time.sleep(2 ** attempt)
-    
     return None
 
-# ============================================================
-# BRAZILIAN SOURCES - Fixed & Working
-# ============================================================
-
-def search_programathor() -> List[Dict]:
-    """Search Programathor jobs API - Vagas brasileiras"""
-    jobs = []
-    try:
-        queries = ['QA', 'Quality Assurance', 'Testes', 'Automação', 'SDET', 'Playwright', 'Cypress', 'Selenium']
-        for query in queries:
-            url = "https://api.programathor.com.br/v2/jobs"
-            params = {'search': query, 'page': 1, 'per_page': 20}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', data.get('data', []))
-                
-                for job in jobs_list[:8]:
-                    job_id = job.get('id', job.get('slug', 'unknown'))
-                    jobs.append({
-                        'title': job.get('title', job.get('name', 'N/A')),
-                        'company': job.get('company_name', job.get('company', {}).get('name', 'N/A')),
-                        'location': job.get('location', job.get('city', 'Remoto')),
-                        'url': f"https://programathor.com.br/jobs/{job_id}",
-                        'id': f"programathor_{job_id}",
-                        'source': 'Programathor',
-                        'country': '🇧🇷 Brasil'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 20:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Programathor: {e}")
-    return jobs
-
-def search_gupy_jobs() -> List[Dict]:
-    """Search Gupy platform jobs"""
-    jobs = []
-    try:
-        queries = ['QA', 'Quality Assurance', 'Testes', 'Automação', 'SDET']
-        for query in queries:
-            url = "https://api.gupy.io/api/v1/jobs"
-            params = {'q': query, 'limit': 20, 'offset': 0}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('data', data.get('jobs', []))
-                
-                for job in jobs_list[:8]:
-                    job_id = job.get('id', 'unknown')
-                    company_info = job.get('company', {}) if isinstance(job.get('company'), dict) else {}
-                    jobs.append({
-                        'title': job.get('name', job.get('title', 'N/A')),
-                        'company': company_info.get('name', job.get('companyName', 'N/A')),
-                        'location': job.get('city', job.get('location', 'Remoto')),
-                        'url': job.get('jobUrl', job.get('url', f"https://portal.gupy.io/job/{job_id}")),
-                        'id': f"gupy_{job_id}",
-                        'source': 'Gupy',
-                        'country': '🇧🇷 Brasil'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 20:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Gupy: {e}")
-    return jobs
-
-def search_trampos() -> List[Dict]:
-    """Search Trampos.co - Vagas brasileiras tech"""
-    jobs = []
-    try:
-        queries = ['QA', 'Quality Assurance', 'Testes', 'Automação', 'SDET']
-        for query in queries:
-            url = "https://api.trampos.co/v1/oportunidades"
-            params = {'q': query, 'page': 1, 'per_page': 15}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict):
-                    jobs_list = data.get('oportunidades', data.get('data', []))
-                elif isinstance(data, list):
-                    jobs_list = data
-                else:
-                    jobs_list = []
-                
-                for job in jobs_list[:8]:
-                    job_id = job.get('id', job.get('slug', 'unknown'))
-                    jobs.append({
-                        'title': job.get('titulo', job.get('title', 'N/A')),
-                        'company': job.get('empresa', job.get('company', {}).get('nome', 'N/A')),
-                        'location': job.get('localidade', job.get('city', 'Remoto')),
-                        'url': f"https://trampos.co/oportunidade/{job_id}",
-                        'id': f"trampos_{job_id}",
-                        'source': 'Trampos.co',
-                        'country': '🇧🇷 Brasil'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 20:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Trampos: {e}")
-    return jobs
-
-def search_revelo() -> List[Dict]:
-    """Search Revelo - Brazilian tech jobs platform"""
-    jobs = []
-    try:
-        queries = ['qa', 'quality-assurance', 'testes', 'automacao', 'sdet']
-        for query in queries:
-            url = f"https://api.revelo.com.br/v1/jobs"
-            params = {'search': query, 'limit': 15}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', data.get('data', []))
-                
-                for job in jobs_list[:8]:
-                    job_id = job.get('id', 'unknown')
-                    jobs.append({
-                        'title': job.get('title', job.get('name', 'N/A')),
-                        'company': job.get('company', {}).get('name', 'N/A') if isinstance(job.get('company'), dict) else job.get('company_name', 'N/A'),
-                        'location': job.get('location', 'Remoto'),
-                        'url': f"https://www.revelo.com.br/vaga/{job_id}",
-                        'id': f"revelo_{job_id}",
-                        'source': 'Revelo',
-                        'country': '🇧🇷 Brasil'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 20:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Revelo: {e}")
-    return jobs
-
-def search_geekhunter() -> List[Dict]:
-    """Search GeekHunter - Brazilian dev jobs"""
-    jobs = []
-    try:
-        url = "https://api.geekhunter.com.br/v1/jobs"
-        params = {'q': 'QA', 'limit': 15}
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, params=params, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            jobs_list = data.get('jobs', data.get('data', []))
-            
-            for job in jobs_list[:10]:
-                job_id = job.get('id', 'unknown')
-                jobs.append({
-                    'title': job.get('title', job.get('name', 'N/A')),
-                    'company': job.get('company', {}).get('name', 'N/A') if isinstance(job.get('company'), dict) else job.get('company_name', 'N/A'),
-                    'location': job.get('city', job.get('location', 'Remoto')),
-                    'url': f"https://geekhunter.com.br/vaga/{job_id}",
-                    'id': f"geekhunter_{job_id}",
-                    'source': 'GeekHunter',
-                    'country': '🇧🇷 Brasil'
-                })
-    except Exception as e:
-        logger.error(f"Error searching GeekHunter: {e}")
-    return jobs
-
-def search_greenhouse_br() -> List[Dict]:
-    """Search Greenhouse for Brazilian companies"""
-    jobs = []
-    greenhouse_companies_br = [
-        'nubank', 'stone', 'vtex', 'mercadolivre', 'creditas', 
-        'bemobi', 'iqoption', 'quintoandar', 'ebank', 'c6bank',
-        'btg', 'inter', 'xinvest', 'modalmais', 'warren',
-        'ifood', 'loggi', '99', 'getninjas', 'doghero',
-        'eby', 'contabilizei', 'makes', 'rockcontent', 'resultadosdigitais',
-        'pipefy', 'samba', 'take', 'vindi', 'neon'
-    ]
-    
-    try:
-        for company in greenhouse_companies_br[:10]:
-            url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', [])
-                
-                for job in jobs_list:
-                    title = job.get('title', '').lower()
-                    if any(keyword in title for keyword in ['qa', 'quality', 'test', 'tester', 'automation', 'sdet']):
-                        job_id = generate_job_id(job.get('title', ''), company)
-                        jobs.append({
-                            'title': job.get('title', 'N/A'),
-                            'company': company.capitalize(),
-                            'location': job.get('location', {}).get('name', 'Remoto') if isinstance(job.get('location'), dict) else 'Remoto',
-                            'url': job.get('absolute_url', '#'),
-                            'id': f"greenhouse_br_{job_id}",
-                            'source': 'Greenhouse (BR)',
-                            'country': '🇧🇷 Brasil'
-                        })
-                        if len(jobs) >= 8:
-                            break
-            time.sleep(0.3)
-            if len(jobs) >= 8:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Greenhouse BR: {e}")
-    return jobs
 
 # ============================================================
-# INTERNATIONAL REMOTE SOURCES - Enhanced
+# ESTADO PERSISTENTE (dedup)
 # ============================================================
 
-def search_remoteok() -> List[Dict]:
-    """Search Remote OK for remote jobs"""
-    jobs = []
+def load_posted_jobs() -> Dict[str, str]:
+    """Retorna {job_id: iso_timestamp}. Compatível com formato antigo (lista simples)."""
+    if not os.path.exists(POSTED_JOBS_FILE):
+        return {}
     try:
-        url = "https://remoteok.com/api"
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, headers=headers)
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data[1:]:  # First item is metadata
-                if isinstance(job, dict):
-                    title = job.get('position', '').lower()
-                    tags = [tag.lower() for tag in job.get('tags', [])] if job.get('tags') else []
-                    qa_keywords = ['qa', 'quality', 'test', 'tester', 'testing', 'assurance', 'sdet', 'automation', 'playwright', 'cypress', 'selenium']
-                    if any(keyword in title for keyword in qa_keywords) or any(keyword in tags for keyword in qa_keywords):
-                        jobs.append({
-                            'title': job.get('position', 'N/A'),
-                            'company': job.get('company', 'N/A'),
-                            'location': job.get('location', 'Remote'),
-                            'url': f"https://remoteok.com/remote-jobs/{job.get('id')}",
-                            'id': f"remoteok_{job.get('id')}",
-                            'source': 'RemoteOK',
-                            'country': '🌎 Internacional (Remote)'
-                        })
-                        if len(jobs) >= 10:
-                            break
+        with open(POSTED_JOBS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            # formato antigo: lista de ids sem timestamp
+            now = datetime.now(timezone.utc).isoformat()
+            return {job_id: now for job_id in data}
+        if isinstance(data, dict):
+            return data
     except Exception as e:
-        logger.error(f"Error searching RemoteOK: {e}")
-    return jobs
+        logger.warning(f"Erro lendo {POSTED_JOBS_FILE}: {e}")
+    return {}
 
-def search_remotive() -> List[Dict]:
-    """Search Remotive.io API"""
-    jobs = []
+
+def save_posted_jobs(posted: Dict[str, str]):
+    """Escrita atômica: grava em arquivo temporário e faz rename."""
     try:
-        url = "https://remotive.com/api/remote-jobs?category=qa"
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data.get('jobs', [])[:12]:
-                title = job.get('title', 'N/A')
-                company = job.get('company_name', 'N/A')
-                job_id = generate_job_id(title, company)
-                jobs.append({
-                    'title': title,
-                    'company': company,
-                    'location': job.get('candidate_required_location', 'Remote'),
-                    'url': job.get('url', '#'),
-                    'id': f"remotive_{job_id}",
-                    'source': 'Remotive',
-                    'country': '🌎 Internacional (Remote)'
-                })
+        dir_name = os.path.dirname(os.path.abspath(POSTED_JOBS_FILE)) or "."
+        with tempfile.NamedTemporaryFile(
+            "w", dir=dir_name, delete=False, suffix=".tmp", encoding="utf-8"
+        ) as tmp:
+            json.dump(posted, tmp, ensure_ascii=False, indent=0)
+            tmp_path = tmp.name
+        os.replace(tmp_path, POSTED_JOBS_FILE)
     except Exception as e:
-        logger.error(f"Error searching Remotive: {e}")
-    return jobs
+        logger.error(f"Erro salvando {POSTED_JOBS_FILE}: {e}")
 
-def search_weworkremotely() -> List[Dict]:
-    """Search We Work Remotely via RSS feed"""
-    jobs = []
-    try:
-        urls = [
-            "https://weworkremotely.com/categories/remote-qa-jobs.rss",
-            "https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss",
-            "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-        ]
-        for url in urls:
-            headers = {'Accept': 'application/rss+xml'}
-            response = make_request(url, headers=headers)
-            
-            if response and response.status_code == 200:
-                root = ET.fromstring(response.content)
-                for item in root.findall('.//item')[:8]:
-                    title = item.find('title').text if item.find('title') is not None else 'N/A'
-                    link = item.find('link').text if item.find('link') is not None else '#'
-                    description = item.find('description').text if item.find('description') is not None else ''
-                    
-                    if any(keyword in title.lower() for keyword in ['qa', 'quality', 'test', 'tester', 'automation', 'sdet', 'playwright', 'cypress', 'selenium']):
-                        company = 'Various'
-                        if ' at ' in title:
-                            company = title.split(' at ')[-1]
-                        
-                        job_id = generate_job_id(title, company)
-                        jobs.append({
-                            'title': title,
-                            'company': company,
-                            'location': 'Remote',
-                            'url': link,
-                            'id': f"weworkremotely_{job_id}",
-                            'source': 'WeWorkRemotely',
-                            'country': '🌎 Internacional (Remote)'
-                        })
-    except Exception as e:
-        logger.error(f"Error searching WeWorkRemotely: {e}")
-    return jobs
 
-def search_landing_jobs() -> List[Dict]:
-    """Search Landing.jobs - European/Remote jobs"""
-    jobs = []
-    try:
-        queries = ['qa', 'quality assurance', 'tester', 'sdet', 'test automation']
-        for query in queries:
-            url = "https://landing.jobs/api/v1/jobs"
-            params = {'q': query, 'remote': 'true', 'limit': 15}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', data.get('data', []))
-                
-                for job in jobs_list[:8]:
-                    if not isinstance(job, dict):
-                        continue
-                    
-                    title = job.get('title', job.get('name', 'N/A'))
-                    company_data = job.get('company', {})
-                    company = company_data.get('name', 'N/A') if isinstance(company_data, dict) else job.get('company_name', 'N/A')
-                    job_id = generate_job_id(title, str(company))
-                    
-                    jobs.append({
-                        'title': title,
-                        'company': company,
-                        'location': job.get('remote', 'Remote'),
-                        'url': job.get('url', job.get('link', '#')),
-                        'id': f"landingjobs_{job_id}",
-                        'source': 'Landing.jobs',
-                        'country': '🌎 Internacional'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 15:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Landing.jobs: {e}")
-    return jobs
-
-def search_wellfound() -> List[Dict]:
-    """Search Wellfound (AngelList) - startup jobs"""
-    jobs = []
-    try:
-        queries = ['qa', 'quality assurance', 'test engineer', 'sdet', 'test automation']
-        for query in queries:
-            url = "https://wellfound.com/api/v1/jobs"
-            params = {'query': query, 'remote': 'true', 'limit': 10}
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', data.get('data', []))
-                
-                for job in jobs_list[:6]:
-                    title = job.get('title', 'N/A')
-                    company = job.get('startup', {}).get('name', 'N/A')
-                    job_id = generate_job_id(title, company)
-                    jobs.append({
-                        'title': title,
-                        'company': company,
-                        'location': job.get('location', 'Remote'),
-                        'url': f"https://wellfound.com/jobs/{job.get('id')}",
-                        'id': f"wellfound_{job_id}",
-                        'source': 'Wellfound',
-                        'country': '🌎 Internacional'
-                    })
-            time.sleep(0.5)
-            if len(jobs) >= 10:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Wellfound: {e}")
-    return jobs
-
-def search_github_jobs() -> List[Dict]:
-    """Search GitHub Jobs via search API"""
-    jobs = []
-    try:
-        queries = [
-            '(qa OR "quality assurance" OR tester OR sdet) in:title label:job,hiring',
-            '(automation OR "test engineer") in:title label:job,hiring',
-            '(playwright OR cypress OR selenium) in:title label:job,hiring',
-        ]
-        
-        for query in queries:
-            url = "https://api.github.com/search/issues"
-            params = {
-                'q': query,
-                'sort': 'created',
-                'order': 'desc',
-                'per_page': 15
-            }
-            headers = {'Accept': 'application/vnd.github+json'}
-            response = make_request(url, params=params, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                for item in data.get('items', [])[:8]:
-                    title = item.get('title', 'N/A')
-                    if any(kw in title.lower() for kw in ['qa', 'quality', 'test', 'tester', 'sdet', 'automation', 'playwright', 'cypress', 'selenium']):
-                        job_id = generate_job_id(title, 'GitHub')
-                        jobs.append({
-                            'title': title,
-                            'company': item.get('user', {}).get('login', 'GitHub Community'),
-                            'location': 'Remote',
-                            'url': item.get('html_url', '#'),
-                            'id': f"github_{job_id}",
-                            'source': 'GitHub Jobs',
-                            'country': '🌎 Internacional'
-                        })
-            time.sleep(1)  # GitHub API rate limit
-    except Exception as e:
-        logger.error(f"Error searching GitHub Jobs: {e}")
-    return jobs
-
-def search_stack_overflow_jobs() -> List[Dict]:
-    """Search Stack Overflow Jobs via RSS"""
-    jobs = []
-    try:
-        queries = [
-            'qa+quality+assurance+tester+automation+sdet',
-            'playwright+cypress+selenium',
-            'test+automation+engineer',
-        ]
-        
-        for query in queries:
-            url = f"https://stackoverflow.com/jobs/feed?q={query}"
-            headers = {'Accept': 'application/rss+xml'}
-            response = make_request(url, headers=headers)
-            
-            if response and response.status_code == 200:
-                root = ET.fromstring(response.content)
-                for item in root.findall('.//item')[:8]:
-                    title = item.find('title').text if item.find('title') is not None else 'N/A'
-                    link = item.find('link').text if item.find('link') is not None else '#'
-                    
-                    if title and any(keyword in title.lower() for keyword in ['qa', 'quality', 'test', 'tester', 'automation', 'sdet', 'playwright', 'cypress', 'selenium']):
-                        company = 'Various'
-                        if ' at ' in title:
-                            company = title.split(' at ')[-1]
-                        
-                        job_id = generate_job_id(title, company)
-                        jobs.append({
-                            'title': title,
-                            'company': company,
-                            'location': 'Remote',
-                            'url': link,
-                            'id': f"stackoverflow_{job_id}",
-                            'source': 'Stack Overflow',
-                            'country': '🌎 Internacional'
-                        })
-    except Exception as e:
-        logger.error(f"Error searching Stack Overflow: {e}")
-    return jobs
-
-def search_himalayas() -> List[Dict]:
-    """Search Himalayas - remote jobs"""
-    jobs = []
-    try:
-        url = "https://himalayas.app/api/v1/jobs"
-        params = {'search': 'qa', 'remote': 'true', 'limit': 15}
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, params=params, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data.get('jobs', [])[:10]:
-                title = job.get('title', 'N/A')
-                company = job.get('company', {}).get('name', 'N/A')
-                job_id = generate_job_id(title, company)
-                jobs.append({
-                    'title': title,
-                    'company': company,
-                    'location': job.get('location', 'Remote'),
-                    'url': f"https://himalayas.app/jobs/{job_id}",
-                    'id': f"himalayas_{job_id}",
-                    'source': 'Himalayas',
-                    'country': '🌎 Internacional (Remote)'
-                })
-    except Exception as e:
-        logger.error(f"Error searching Himalayas: {e}")
-    return jobs
-
-def search_otta() -> List[Dict]:
-    """Search Otta - modern job board"""
-    jobs = []
-    try:
-        url = "https://api.otta.com/v1/jobs"
-        params = {'query': 'qa', 'remote': 'true', 'limit': 15}
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, params=params, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data.get('jobs', data.get('data', []))[:10]:
-                title = job.get('title', 'N/A')
-                company = job.get('company', {}).get('name', 'N/A') if isinstance(job.get('company'), dict) else job.get('companyName', 'N/A')
-                job_id = generate_job_id(title, company)
-                jobs.append({
-                    'title': title,
-                    'company': company,
-                    'location': job.get('location', 'Remote'),
-                    'url': f"https://otta.com/jobs/{job_id}",
-                    'id': f"otta_{job_id}",
-                    'source': 'Otta',
-                    'country': '🌎 Internacional (Remote)'
-                })
-    except Exception as e:
-        logger.error(f"Error searching Otta: {e}")
-    return jobs
-
-def search_arc_dev() -> List[Dict]:
-    """Search Arc.dev - remote developer jobs"""
-    jobs = []
-    try:
-        url = "https://arc.dev/api/v1/jobs"
-        params = {'role': 'qa', 'remote': 'true', 'limit': 10}
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, params=params, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data.get('jobs', [])[:8]:
-                title = job.get('title', 'N/A')
-                company = job.get('company', {}).get('name', 'N/A')
-                job_id = generate_job_id(title, company)
-                jobs.append({
-                    'title': title,
-                    'company': company,
-                    'location': job.get('location', 'Remote'),
-                    'url': f"https://arc.dev/jobs/{job_id}",
-                    'id': f"arc_dev_{job_id}",
-                    'source': 'Arc.dev',
-                    'country': '🌎 Internacional (Remote)'
-                })
-    except Exception as e:
-        logger.error(f"Error searching Arc.dev: {e}")
-    return jobs
-
-def search_remote_rocketship() -> List[Dict]:
-    """Search Remote Rocketship"""
-    jobs = []
-    try:
-        url = "https://api.remoterocketship.com/v1/jobs"
-        params = {'search': 'qa', 'limit': 15}
-        headers = {'Accept': 'application/json'}
-        response = make_request(url, params=params, headers=headers)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            for job in data.get('jobs', [])[:10]:
-                title = job.get('title', 'N/A')
-                company = job.get('company', 'N/A')
-                job_id = generate_job_id(title, company)
-                jobs.append({
-                    'title': title,
-                    'company': company,
-                    'location': job.get('location', 'Remote'),
-                    'url': job.get('url', f"https://remoterocketship.com/jobs/{job_id}"),
-                    'id': f"remote_rocketship_{job_id}",
-                    'source': 'Remote Rocketship',
-                    'country': '🌎 Internacional (Remote)'
-                })
-    except Exception as e:
-        logger.error(f"Error searching Remote Rocketship: {e}")
-    return jobs
-
-def search_greenhouse_global() -> List[Dict]:
-    """Search Greenhouse for global companies"""
-    jobs = []
-    greenhouse_companies_global = [
-        'stripe', 'notion', 'linear', 'vercel', 'railway', 
-        'planetscale', 'supabase', 'prisma', 'temporal', 'turso',
-        'netlify', 'cloudflare', 'datadog', 'hashicorp', 'mongodb',
-        'figma', 'miro', 'airtable', 'webflow', 'zapier',
-        'github', 'gitlab', 'atlassian', 'shopify', 'twilio',
-        'coinbase', 'robinhood', 'plaid', 'square',
-        'openai', 'anthropic', 'cohere', 'huggingface', 'langchain',
-    ]
-    
-    try:
-        for company in greenhouse_companies_global[:8]:
-            url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
-            headers = {'Accept': 'application/json'}
-            response = make_request(url, headers=headers)
-            
-            if response and response.status_code == 200:
-                data = response.json()
-                jobs_list = data.get('jobs', [])
-                
-                for job in jobs_list:
-                    title = job.get('title', '').lower()
-                    if any(keyword in title for keyword in ['qa', 'quality', 'test', 'tester', 'automation', 'sdet']):
-                        job_id = generate_job_id(job.get('title', ''), company)
-                        jobs.append({
-                            'title': job.get('title', 'N/A'),
-                            'company': company.capitalize(),
-                            'location': job.get('location', {}).get('name', 'Remote') if isinstance(job.get('location'), dict) else 'Remote',
-                            'url': job.get('absolute_url', '#'),
-                            'id': f"greenhouse_int_{job_id}",
-                            'source': 'Greenhouse (Global)',
-                            'country': '🌎 Internacional'
-                        })
-                        if len(jobs) >= 6:
-                            break
-            time.sleep(0.3)
-            if len(jobs) >= 6:
-                break
-    except Exception as e:
-        logger.error(f"Error searching Greenhouse Global: {e}")
-    return jobs
-
-# ============================================================
-# RSS/FEED SOURCES
-# ============================================================
-
-def search_indeed_rss() -> List[Dict]:
-    """Search Indeed RSS"""
-    jobs = []
-    try:
-        url = "https://rss.indeed.com/rss?q=qa+quality+tester&l=Remote"
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; QAJobBot/1.0)', 'Accept': 'application/rss+xml'}
-        response = make_request(url, headers=headers)
-        
-        if response and response.status_code == 200:
-            root = ET.fromstring(response.content)
-            for item in root.findall('.//item')[:8]:
-                title = item.find('title').text if item.find('title') is not None else 'N/A'
-                link = item.find('link').text if item.find('link') is not None else '#'
-                
-                if title and any(keyword in title.lower() for keyword in ['qa', 'quality', 'test', 'tester']):
-                    company = 'Various'
-                    if ' at ' in title:
-                        company = title.split(' at ')[-1]
-                    
-                    job_id = generate_job_id(title, company)
-                    jobs.append({
-                        'title': title,
-                        'company': company,
-                        'location': 'Remote',
-                        'url': link,
-                        'id': f"indeed_{job_id}",
-                        'source': 'Indeed',
-                        'country': '🌎 Internacional'
-                    })
-    except Exception as e:
-        logger.error(f"Error searching Indeed RSS: {e}")
-    return jobs
-
-def search_glassdoor_rss() -> List[Dict]:
-    """Search Glassdoor RSS"""
-    jobs = []
-    try:
-        url = "https://www.glassdoor.com/rss/jobs/q-qa-quality-tester-l-remote"
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; QAJobBot/1.0)', 'Accept': 'application/rss+xml'}
-        response = make_request(url, headers=headers)
-        
-        if response and response.status_code == 200:
-            root = ET.fromstring(response.content)
-            for item in root.findall('.//item')[:8]:
-                title = item.find('title').text if item.find('title') is not None else 'N/A'
-                link = item.find('link').text if item.find('link') is not None else '#'
-                
-                if title and any(keyword in title.lower() for keyword in ['qa', 'quality', 'test', 'tester']):
-                    company = 'Various'
-                    if ' at ' in title:
-                        company = title.split(' at ')[-1]
-                    
-                    job_id = generate_job_id(title, company)
-                    jobs.append({
-                        'title': title,
-                        'company': company,
-                        'location': 'Remote',
-                        'url': link,
-                        'id': f"glassdoor_{job_id}",
-                        'source': 'Glassdoor',
-                        'country': '🌎 Internacional'
-                    })
-    except Exception as e:
-        logger.error(f"Error searching Glassdoor RSS: {e}")
-    return jobs
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def search_all_sources() -> List[Dict]:
-    """Search all enabled sources and return combined results"""
-    all_jobs = []
-    
-    sources = [
-        # Brazilian sources (prioritize)
-        ('Programathor (BR)', search_programathor),
-        ('Gupy (BR)', search_gupy_jobs),
-        ('Trampos (BR)', search_trampos),
-        ('Revelo (BR)', search_revelo),
-        ('GeekHunter (BR)', search_geekhunter),
-        ('Greenhouse (BR)', search_greenhouse_br),
-        
-        # International sources
-        ('RemoteOK (INT)', search_remoteok),
-        ('Remotive (INT)', search_remotive),
-        ('WeWorkRemotely (INT)', search_weworkremotely),
-        ('Landing.jobs (INT)', search_landing_jobs),
-        ('Wellfound (INT)', search_wellfound),
-        ('GitHub Jobs (INT)', search_github_jobs),
-        ('Stack Overflow (INT)', search_stack_overflow_jobs),
-        ('Himalayas (INT)', search_himalayas),
-        ('Otta (INT)', search_otta),
-        ('Arc.dev (INT)', search_arc_dev),
-        ('Remote Rocketship (INT)', search_remote_rocketship),
-        ('Greenhouse (Global)', search_greenhouse_global),
-        
-        # RSS feeds
-        ('Indeed RSS (INT)', search_indeed_rss),
-        ('Glassdoor RSS (INT)', search_glassdoor_rss),
-    ]
-    
-    for source_name, search_func in sources:
-        logger.info(f"Searching {source_name}...")
+def prune_old_entries(posted: Dict[str, str]) -> Dict[str, str]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=KEEP_HISTORY_DAYS)
+    pruned = {}
+    for job_id, ts in posted.items():
         try:
-            found = search_func()
-            logger.info(f"Found {len(found)} jobs from {source_name}")
-            all_jobs.extend(found)
-        except Exception as e:
-            logger.error(f"Error in {source_name}: {e}")
-    
+            when = datetime.fromisoformat(ts)
+        except Exception:
+            pruned[job_id] = ts  # mantém se não conseguir parsear
+            continue
+        if when >= cutoff:
+            pruned[job_id] = ts
+    return pruned
+
+
+# ============================================================
+# FONTES REAIS (todas verificadas)
+# ============================================================
+
+def search_remoteok() -> List[Job]:
+    jobs = []
+    resp = make_request("https://remoteok.com/api")
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    for item in data:
+        if not isinstance(item, dict) or "position" not in item:
+            continue  # primeiro item é metadata da API, sem "position"
+        title = item.get("position", "")
+        tags = " ".join(item.get("tags", []) or [])
+        if not is_qa_job(title) and not is_qa_job(tags):
+            continue
+        jobs.append(Job(
+            title=title,
+            company=item.get("company", "N/A"),
+            location=item.get("location") or "Remote",
+            url=item.get("url") or f"https://remoteok.com/remote-jobs/{item.get('id')}",
+            source="RemoteOK",
+            country="🌎 Internacional (Remote)",
+            salary=_remoteok_salary(item),
+        ))
+    return jobs
+
+
+def _remoteok_salary(item: dict) -> Optional[str]:
+    lo, hi = item.get("salary_min"), item.get("salary_max")
+    if lo and hi:
+        return f"${lo:,} - ${hi:,}"
+    return None
+
+
+def search_remotive() -> List[Job]:
+    jobs = []
+    resp = make_request("https://remotive.com/api/remote-jobs", params={"category": "qa-testing"})
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    for item in data.get("jobs", []):
+        title = item.get("title", "N/A")
+        if not is_qa_job(title):
+            continue
+        jobs.append(Job(
+            title=title,
+            company=item.get("company_name", "N/A"),
+            location=item.get("candidate_required_location") or "Remote",
+            url=item.get("url", "#"),
+            source="Remotive",
+            country="🌎 Internacional (Remote)",
+            salary=item.get("salary") or None,
+        ))
+    return jobs
+
+
+def search_arbeitnow() -> List[Job]:
+    jobs = []
+    resp = make_request("https://www.arbeitnow.com/api/job-board-api")
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    for item in data.get("data", []):
+        title = item.get("title", "N/A")
+        tags = " ".join(item.get("tags", []) or [])
+        if not is_qa_job(title) and not is_qa_job(tags):
+            continue
+        jobs.append(Job(
+            title=title,
+            company=item.get("company_name", "N/A"),
+            location=item.get("location") or ("Remote" if item.get("remote") else "N/A"),
+            url=item.get("url", "#"),
+            source="Arbeitnow",
+            country="🌍 Europa/Remote",
+        ))
+    return jobs
+
+
+def search_jobicy() -> List[Job]:
+    jobs = []
+    resp = make_request(
+        "https://jobicy.com/api/v2/remote-jobs",
+        params={"count": 50, "tag": "qa"},
+    )
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    for item in data.get("jobs", []):
+        title = item.get("jobTitle", "N/A")
+        if not is_qa_job(title):
+            continue
+        salary = None
+        if item.get("annualSalaryMin") and item.get("annualSalaryMax"):
+            salary = f"{item['annualSalaryMin']} - {item['annualSalaryMax']} {item.get('salaryCurrency', '')}".strip()
+        jobs.append(Job(
+            title=title,
+            company=item.get("companyName", "N/A"),
+            location=item.get("jobGeo") or "Remote",
+            url=item.get("url", "#"),
+            source="Jobicy",
+            country="🌎 Internacional (Remote)",
+            salary=salary,
+            posted_at=item.get("pubDate"),
+        ))
+    return jobs
+
+
+def search_weworkremotely() -> List[Job]:
+    jobs = []
+    feeds = [
+        "https://weworkremotely.com/categories/remote-qa-jobs.rss",
+        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
+    ]
+    for url in feeds:
+        resp = make_request(url, headers={"Accept": "application/rss+xml"})
+        if not (resp and resp.status_code == 200):
+            continue
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            continue
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            title = title_el.text.strip() if title_el is not None else "N/A"
+            link = link_el.text if link_el is not None else "#"
+            if not is_qa_job(title):
+                continue
+            company = "Various"
+            if title and ":" in title:  # formato comum: "Company: Job Title"
+                company, _, rest = title.partition(":")
+                title = rest.strip() or title
+            jobs.append(Job(
+                title=title,
+                company=company.strip(),
+                location="Remote",
+                url=link,
+                source="We Work Remotely",
+                country="🌎 Internacional (Remote)",
+            ))
+    return jobs
+
+
+def search_greenhouse_company(company: str) -> List[Job]:
+    jobs = []
+    url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
+    resp = make_request(url, params={"content": "true"})
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    for item in data.get("jobs", []):
+        title = item.get("title", "N/A")
+        if not is_qa_job(title):
+            continue
+        location = item.get("location", {})
+        loc_name = location.get("name") if isinstance(location, dict) else "N/A"
+        jobs.append(Job(
+            title=title,
+            company=company.capitalize(),
+            location=loc_name or "N/A",
+            url=item.get("absolute_url", "#"),
+            source="Greenhouse",
+            country="🌎 Internacional",
+        ))
+    return jobs
+
+
+def search_greenhouse_all() -> List[Job]:
+    jobs = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(search_greenhouse_company, c): c for c in GREENHOUSE_COMPANIES}
+        for fut in as_completed(futures):
+            try:
+                jobs.extend(fut.result())
+            except Exception as e:
+                logger.error(f"Erro Greenhouse/{futures[fut]}: {e}")
+    return jobs
+
+
+def search_lever_company(company: str) -> List[Job]:
+    jobs = []
+    url = f"https://api.lever.co/v0/postings/{company}"
+    resp = make_request(url, params={"mode": "json"})
+    if not (resp and resp.status_code == 200):
+        return jobs
+    try:
+        data = resp.json()
+    except ValueError:
+        return jobs
+    if not isinstance(data, list):
+        return jobs
+    for item in data:
+        title = item.get("text", "N/A")
+        if not is_qa_job(title):
+            continue
+        categories = item.get("categories", {}) or {}
+        jobs.append(Job(
+            title=title,
+            company=company.capitalize(),
+            location=categories.get("location") or "N/A",
+            url=item.get("hostedUrl", "#"),
+            source="Lever",
+            country="🌎 Internacional",
+        ))
+    return jobs
+
+
+def search_lever_all() -> List[Job]:
+    jobs = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(search_lever_company, c): c for c in LEVER_COMPANIES}
+        for fut in as_completed(futures):
+            try:
+                jobs.extend(fut.result())
+            except Exception as e:
+                logger.error(f"Erro Lever/{futures[fut]}: {e}")
+    return jobs
+
+
+# ============================================================
+# ORQUESTRADOR
+# ============================================================
+
+SOURCES = [
+    ("RemoteOK", search_remoteok),
+    ("Remotive", search_remotive),
+    ("Arbeitnow", search_arbeitnow),
+    ("Jobicy", search_jobicy),
+    ("We Work Remotely", search_weworkremotely),
+    ("Greenhouse (empresas)", search_greenhouse_all),
+    ("Lever (empresas)", search_lever_all),
+]
+
+
+def search_all_sources() -> List[Job]:
+    all_jobs: List[Job] = []
+    stats: Dict[str, int] = {}
+
+    with ThreadPoolExecutor(max_workers=len(SOURCES)) as ex:
+        futures = {ex.submit(fn): name for name, fn in SOURCES}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                found = fut.result()
+                stats[name] = len(found)
+                all_jobs.extend(found)
+                logger.info(f"✓ {name}: {len(found)} vaga(s) de QA encontradas")
+            except Exception as e:
+                stats[name] = 0
+                logger.error(f"✗ {name}: erro - {e}")
+
+    logger.info(f"📊 Resumo por fonte: {stats}")
     return all_jobs
 
+
+def deduplicate(jobs: List[Job]) -> List[Job]:
+    seen: Set[str] = set()
+    unique = []
+    for job in jobs:
+        if job.id in seen:
+            continue
+        seen.add(job.id)
+        unique.append(job)
+    return unique
+
+
 # ============================================================
-# DISCORD INTEGRATION
+# DISCORD
 # ============================================================
 
-def create_discord_embed(job: Dict) -> Dict:
-    """Create a rich embed for Discord message"""
-    title_lower = job['title'].lower()
-    seniority_emoji = ""
-    if any(word in title_lower for word in ['jr', 'junior', 'júnior', 'trainee', 'estagio', 'estágio']):
-        seniority_emoji = "🌱 "
-    elif any(word in title_lower for word in ['pleno', 'mid', 'middle']):
-        seniority_emoji = "🚀 "
-    elif any(word in title_lower for word in ['senior', 'sênior', 'sr', 'lead', 'principal', 'staff']):
-        seniority_emoji = "⭐ "
-    
-    work_type_emoji = ""
-    location_lower = job['location'].lower()
-    if any(word in location_lower for word in ['remoto', 'remote', 'anywhere']):
-        work_type_emoji = "🏠"
-    elif any(word in location_lower for word in ['híbrido', 'hybrid']):
-        work_type_emoji = "🔄"
+def create_discord_embed(job: Job) -> dict:
+    seniority = detect_seniority(job.title)
+    location_lower = (job.location or "").lower()
+    if any(w in location_lower for w in ["remoto", "remote", "anywhere"]):
+        work_emoji = "🏠"
+    elif any(w in location_lower for w in ["híbrido", "hybrid"]):
+        work_emoji = "🔄"
     else:
-        work_type_emoji = "🏢"
-    
-    is_br = '🇧🇷' in job.get('country', '')
-    embed_color = 0x00FFFF if is_br else 0xFF10F0
-    
-    description_lines = [
-        f"### 🏢 {job['company']}",
-        "",
-        f"{work_type_emoji} **Local:** {job['location']}",
-    ]
-    
-    if job.get('salary'):
-        description_lines.append(f"💰 **Salário:** {job['salary']}")
-    
-    description = "\n".join(description_lines)
-    
-    embed = {
-        "title": f"{seniority_emoji}{job.get('country', '🌍')} {job['title']}",
-        "description": description,
-        "url": job['url'],
-        "color": embed_color,
-        "footer": {
-            "text": f"📡 {job['source']} • Postado às {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-        },
+        work_emoji = "🏢"
+
+    is_br = "🇧🇷" in job.country
+    color = 0x00FFFF if is_br else 0xFF10F0
+
+    lines = [f"### 🏢 {job.company}", "", f"{work_emoji} **Local:** {job.location}"]
+    if job.salary:
+        lines.append(f"💰 **Salário:** {job.salary}")
+    if seniority:
+        lines.append(f"📈 **Nível:** {seniority}")
+
+    return {
+        "title": f"{job.country} {job.title}"[:256],
+        "description": "\n".join(lines),
+        "url": job.url,
+        "color": color,
+        "footer": {"text": f"📡 {job.source} • {datetime.now().strftime('%d/%m/%Y %H:%M')}"},
         "fields": [{
             "name": "🎯 Como Candidatar",
-            "value": f"**[👉 Clique aqui para ver a vaga completa]({job['url']})**",
-            "inline": False
-        }]
+            "value": f"**[👉 Ver vaga completa]({job.url})**",
+            "inline": False,
+        }],
     }
-    return embed
 
-def send_to_discord(jobs: List[Dict], posted_jobs: Set[str]) -> int:
-    """Send new jobs to Discord webhook"""
+
+def send_to_discord(jobs: List[Job], posted: Dict[str, str]) -> int:
     if not DISCORD_WEBHOOK_URL:
-        logger.warning("DISCORD_WEBHOOK_URL not set, skipping Discord")
+        logger.error("DISCORD_WEBHOOK_URL não configurado - abortando envio.")
         return 0
-    
-    qa_keywords = [
-        'qa', 'quality', 'qualidade', 'tester', 'teste', 'test', 
-        'testing', 'assurance', 'sdet', 'automation', 'automação',
-        'playwright', 'cypress', 'selenium', 'appium', 'test engineer'
-    ]
-    
-    # Filter for QA-related jobs
-    filtered_jobs = [
-        job for job in jobs 
-        if any(keyword in job['title'].lower() for keyword in qa_keywords)
-    ]
-    
-    logger.info(f"Filtered to {len(filtered_jobs)} QA-related jobs")
-    
-    # Remove duplicates based on ID
-    unique_jobs = {}
-    for job in filtered_jobs:
-        if job['id'] not in unique_jobs:
-            unique_jobs[job['id']] = job
-    
-    filtered_jobs = list(unique_jobs.values())
-    logger.info(f"After deduplication: {len(filtered_jobs)} unique jobs")
-    
-    new_count = 0
-    for job in filtered_jobs:
-        if job['id'] in posted_jobs:
-            continue
-        
-        embed = create_discord_embed(job)
-        payload = {"embeds": [embed]}
-        
+
+    new_jobs = [j for j in jobs if j.id not in posted]
+    to_post = new_jobs[:MAX_POSTS_PER_RUN]
+    skipped = len(new_jobs) - len(to_post)
+    if skipped > 0:
+        logger.info(f"⏳ {skipped} vaga(s) além do limite de {MAX_POSTS_PER_RUN}/execução ficarão para a próxima rodada.")
+
+    posted_count = 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for job in to_post:
+        payload = {"embeds": [create_discord_embed(job)]}
         try:
-            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-            if response.status_code in [200, 204]:
-                posted_jobs.add(job['id'])
-                new_count += 1
-                logger.info(f"✓ Posted: {job['title']} at {job['company']}")
+            resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+            if resp.status_code == 204:
+                logger.info(f"✓ Postado: {job.title} @ {job.company}")
+                posted[job.id] = now_iso
+                posted_count += 1
+            elif resp.status_code == 429:
+                retry_after = resp.json().get("retry_after", 2)
+                logger.warning(f"Rate limited pelo Discord, aguardando {retry_after}s")
+                time.sleep(float(retry_after) + 0.5)
             else:
-                logger.error(f"✗ Failed to post {job['title']}: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error posting to Discord: {e}")
-        
-        time.sleep(0.8)  # Rate limiting
-    
-    return new_count
+                logger.error(f"✗ Falha ao postar '{job.title}': HTTP {resp.status_code} - {resp.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro enviando ao Discord: {e}")
+        time.sleep(DISCORD_POST_DELAY)
+
+    return posted_count
+
 
 def send_summary_to_discord(new_count: int, total_found: int):
-    """Send execution summary to Discord"""
     if not DISCORD_WEBHOOK_URL or new_count == 0:
         return
-    
+    if new_count >= 10:
+        emoji, message = "🎉", "Muitas oportunidades hoje!"
+    elif new_count >= 5:
+        emoji, message = "✨", "Várias vagas encontradas!"
+    else:
+        emoji, message = "👍", "Novas oportunidades disponíveis!"
+
+    embed = {
+        "title": f"{emoji} Resumo da Busca",
+        "description": message,
+        "color": 0x36393F,
+        "fields": [
+            {"name": "📊 Vagas Encontradas", "value": f"`{total_found}`", "inline": True},
+            {"name": "🆕 Novas Vagas", "value": f"`{new_count}`", "inline": True},
+        ],
+        "footer": {"text": "🤖 QA Job Bot"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
     try:
-        if new_count >= 10:
-            emoji = "🎉"
-            message = "Muitas oportunidades hoje!"
-        elif new_count >= 5:
-            emoji = "✨"
-            message = "Várias vagas novas encontradas!"
-        elif new_count >= 1:
-            emoji = "👍"
-            message = "Novas oportunidades disponíveis!"
-        else:
-            return
-        
-        embed = {
-            "title": f"{emoji} Resumo da Busca de Vagas QA",
-            "description": message,
-            "color": 0x36393F,
-            "fields": [
-                {"name": "📊 Vagas Encontradas", "value": f"`{total_found}`", "inline": True},
-                {"name": "🆕 Novas Postadas", "value": f"`{new_count}`", "inline": True},
-                {"name": "⏰ Próxima Busca", "value": "`Em ~30 min`", "inline": True}
-            ],
-            "footer": {"text": "🤖 QA Jobs Bot • Rodando via GitHub Actions"},
-            "timestamp": datetime.utcnow().isoformat()
-        }
-        
         requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]}, timeout=10)
-    except Exception as e:
-        logger.error(f"Error sending summary: {e}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Erro enviando resumo: {e}")
+
 
 # ============================================================
 # MAIN
 # ============================================================
 
 def main():
-    logger.info(f"🔍 Starting QA job search at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Load previously posted jobs
-    posted_jobs = load_posted_jobs()
-    logger.info(f"📝 Tracking {len(posted_jobs)} previously posted jobs")
-    
-    # Collect jobs from all sources
+    start = time.time()
+    logger.info(f"🔍 Iniciando busca de vagas de QA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    posted = load_posted_jobs()
+    logger.info(f"📝 {len(posted)} vaga(s) já rastreadas no histórico")
+
     all_jobs = search_all_sources()
-    
-    logger.info(f"📊 Found {len(all_jobs)} total jobs from all sources")
-    
-    # Filter for QA-related jobs
-    qa_keywords = [
-        'qa', 'quality', 'qualidade', 'tester', 'teste', 'test', 
-        'testing', 'assurance', 'sdet', 'automation', 'automação',
-        'playwright', 'cypress', 'selenium', 'appium', 'test engineer'
-    ]
-    filtered_jobs = [
-        job for job in all_jobs 
-        if any(keyword in job['title'].lower() for keyword in qa_keywords)
-    ]
-    
-    logger.info(f"🎯 Filtered to {len(filtered_jobs)} QA-related jobs")
-    
-    # Remove duplicates based on ID
-    unique_jobs = {}
-    for job in filtered_jobs:
-        if job['id'] not in unique_jobs:
-            unique_jobs[job['id']] = job
-    
-    filtered_jobs = list(unique_jobs.values())
-    logger.info(f"🔄 After deduplication: {len(filtered_jobs)} unique jobs")
-    
-    # Send to Discord
-    new_count = send_to_discord(filtered_jobs, posted_jobs)
-    
-    # Send summary
-    send_summary_to_discord(new_count, len(filtered_jobs))
-    
-    # Save updated posted jobs
-    save_posted_jobs(posted_jobs)
-    
-    logger.info(f"✅ Posted {new_count} new jobs")
-    logger.info(f"📝 Total tracked jobs: {len(posted_jobs)}")
-    
-    # Clean up old jobs (keep only last 1000)
-    if len(posted_jobs) > 1000:
-        posted_jobs_list = list(posted_jobs)
-        posted_jobs = set(posted_jobs_list[-1000:])
-        save_posted_jobs(posted_jobs)
-        logger.info(f"🧹 Cleaned up old jobs, now tracking {len(posted_jobs)}")
+    logger.info(f"📊 {len(all_jobs)} vaga(s) de QA encontradas no total (antes de dedup)")
+
+    unique_jobs = deduplicate(all_jobs)
+    logger.info(f"🔄 {len(unique_jobs)} vaga(s) únicas após deduplicação")
+
+    new_count = send_to_discord(unique_jobs, posted)
+
+    send_summary_to_discord(new_count, len(unique_jobs))
+
+    posted = prune_old_entries(posted)
+    save_posted_jobs(posted)
+
+    elapsed = time.time() - start
+    logger.info(f"✅ {new_count} nova(s) vaga(s) postada(s) em {elapsed:.1f}s")
+    logger.info(f"📝 {len(posted)} vaga(s) no histórico após limpeza (mantém {KEEP_HISTORY_DAYS} dias)")
+
+    if not DISCORD_WEBHOOK_URL:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
