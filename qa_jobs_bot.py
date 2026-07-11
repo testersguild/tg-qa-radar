@@ -60,15 +60,65 @@ LEVER_COMPANIES = [
 ] or DEFAULT_LEVER_COMPANIES
 
 QA_KEYWORDS = [
-    r"qa", r"quality assurance", r"qualidade", r"tester", r"testador",
-    r"testadora", r"teste", r"tests?", r"testing", r"assurance", r"sdet",
-    r"automation", r"automa[cç][aã]o", r"playwright", r"cypress", r"selenium",
-    r"appium", r"postman", r"cucumber", r"robot framework", r"test engineer",
-    r"engenheiro de testes", r"engenheira de testes",
+    r"qa",
+    r"quality assurance",
+    r"qualidade",
+    r"tester",
+    r"testador",
+    r"testadora",
+    r"teste",
+    r"tests?",
+    r"testing",
+    r"assurance",
+    r"sdet",
+    r"playwright",
+    r"cypress",
+    r"selenium",
+    r"appium",
+    r"postman",
+    r"cucumber",
+    r"robot framework",
+    r"test engineer",
+    r"engenheiro de testes",
+    r"engenheira de testes",
 ]
 # Regex único com \b para evitar falsos positivos tipo "contest", "latest".
 QA_PATTERN = re.compile(
     r"\b(" + "|".join(QA_KEYWORDS) + r")\b", flags=re.IGNORECASE
+)
+
+# Palavras que NÃO são QA (para filtrar falsos positivos)
+NON_QA_EXCLUDE = [
+    r"\barchitect\b",
+    r"\bdrafter\b",
+    r"\bdesigner\b",
+    r"\bdeveloper\b",
+    r"\bdevops\b",
+    r"\bbackend\b",
+    r"\bfrontend\b",
+    r"\bfullstack\b",
+    r"\bdata scientist\b",
+    r"\bdata engineer\b",
+    r"\bml engineer\b",
+    r"\bmachine learning\b",
+    r"\bproduct manager\b",
+    r"\bproject manager\b",
+    r"\bscrum master\b",
+    r"\btech lead\b",
+    r"\bengineering manager\b",
+    r"\bsupport\b",
+    r"\bcustomer\b",
+    r"\bsales\b",
+    r"\bmarketing\b",
+    r"\bhr\b",
+    r"\brecruiter\b",
+    r"\bui/ux\b",
+    r"\bux\b",
+    r"\bui\b",
+]
+
+NON_QA_PATTERN = re.compile(
+    "|".join(NON_QA_EXCLUDE), flags=re.IGNORECASE
 )
 
 SENIORITY_PATTERNS = {
@@ -111,7 +161,15 @@ def generate_job_id(title: str, company: str, source: str = "") -> str:
 
 
 def is_qa_job(title: str) -> bool:
-    return bool(QA_PATTERN.search(title or ""))
+    if not title:
+        return False
+    # Must match QA keywords
+    if not QA_PATTERN.search(title):
+        return False
+    # Must NOT match excluded terms
+    if NON_QA_PATTERN.search(title):
+        return False
+    return True
 
 
 def detect_seniority(title: str) -> str:
