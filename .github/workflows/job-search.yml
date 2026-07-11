@@ -3,7 +3,7 @@ name: QA Jobs Search Bot
 on:
   schedule:
     # Runs every 30 minutes
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI
 
 permissions:
