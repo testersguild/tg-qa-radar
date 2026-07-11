@@ -60,17 +60,16 @@ LEVER_COMPANIES = [
 ] or DEFAULT_LEVER_COMPANIES
 
 QA_KEYWORDS = [
-    r"qa",
+    r"\bqa\b",
     r"quality assurance",
     r"qualidade",
     r"tester",
     r"testador",
     r"testadora",
-    r"teste",
-    r"tests?",
-    r"testing",
-    r"assurance",
-    r"sdet",
+    r"\bteste\b",
+    r"\btests?\b",
+    r"\btesting\b",
+    r"\bsdet\b",
     r"playwright",
     r"cypress",
     r"selenium",
@@ -84,7 +83,7 @@ QA_KEYWORDS = [
 ]
 # Regex único com \b para evitar falsos positivos tipo "contest", "latest".
 QA_PATTERN = re.compile(
-    r"\b(" + "|".join(QA_KEYWORDS) + r")\b", flags=re.IGNORECASE
+    "|".join(QA_KEYWORDS), flags=re.IGNORECASE
 )
 
 # Palavras que NÃO são QA (para filtrar falsos positivos)
@@ -115,6 +114,25 @@ NON_QA_EXCLUDE = [
     r"\bui/ux\b",
     r"\bux\b",
     r"\bui\b",
+    r"\bassurance\b",
+    r"\bmechatronic\b",
+    r"\btechnician\b",
+    r"\boperator\b",
+    r"\bclerk\b",
+    r"\bdriver\b",
+    r"\bdiver\b",
+    r"\bnavigator\b",
+    r"\bhealth\b",
+    r"\brestaurant\b",
+    r"\bdrafter\b",
+    r"\bcoordinator\b",
+    r"\badministrative\b",
+    r"\binstructor\b",
+    r"\bspecialist\b",
+    r"\bmanager\b",
+    r"\bdirector\b",
+    r"\bvp\b",
+    r"\bvice president\b",
 ]
 
 NON_QA_PATTERN = re.compile(
